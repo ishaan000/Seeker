@@ -30,13 +30,6 @@ const jobTypes = [
   { value: "hybrid", label: "Hybrid" },
 ];
 
-const jobLevels = [
-  { value: "entry", label: "Entry Level" },
-  { value: "mid", label: "Mid Level" },
-  { value: "senior", label: "Senior Level" },
-  { value: "manager", label: "Management" },
-  { value: "executive", label: "Executive" },
-];
 
 export default function IntakePage() {
   const router = useRouter();
@@ -53,7 +46,6 @@ export default function IntakePage() {
     target_locations: "",
     years_experience: "",
     skills: "",
-    job_level: "mid",
   });
 
   const handleChange = (
@@ -99,7 +91,6 @@ export default function IntakePage() {
           .split(",")
           .map((s) => s.trim())
           .filter((s) => s),
-        jobLevel: form.job_level,
       },
     };
 
@@ -458,36 +449,6 @@ export default function IntakePage() {
                   },
                 }}
               />
-              <TextField
-                select
-                label="Job Level"
-                name="job_level"
-                value={form.job_level}
-                onChange={handleChange}
-                sx={{
-                  "& .MuiOutlinedInput-root": {
-                    transition: "all 0.3s ease",
-                    "&:hover": {
-                      "& fieldset": {
-                        borderColor: "rgba(151, 71, 255, 0.5)",
-                      },
-                    },
-                    "&.Mui-focused": {
-                      "& fieldset": {
-                        borderColor: "#9747FF",
-                        boxShadow: "0 0 0 2px rgba(151, 71, 255, 0.1)",
-                      },
-                    },
-                  },
-                }}
-              >
-                {jobLevels.map((level) => (
-                  <MenuItem key={level.value} value={level.value}>
-                    {level.label}
-                  </MenuItem>
-                ))}
-              </TextField>
-
               <Button
                 onClick={handleSubmit}
                 variant="contained"

@@ -13,7 +13,6 @@ interface RegisterFormData {
     targetLocations: string[];
     yearsExperience: number;
     skills: string[];
-    jobLevel: string;
   };
 }
 

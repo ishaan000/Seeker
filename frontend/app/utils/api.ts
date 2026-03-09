@@ -1,3 +1,31 @@
+export interface UserProfile {
+  id: string;
+  name: string;
+  email: string;
+  company: string;
+  title: string;
+  industry: string;
+  preferences: {
+    jobTypes?: string[];
+    targetCompanies?: string[];
+    targetLocations?: string[];
+    yearsExperience?: number;
+    skills?: string[];
+  };
+}
+
+export const fetchUser = async (userId: string): Promise<UserProfile> => {
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5001";
+  const res = await fetch(`${apiUrl}/user/${userId}`);
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Fetch user failed: ${res.status} - ${err}`);
+  }
+
+  return res.json();
+};
+
 export const sendChatMessage = async (message: string, sessionId: string) => {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5001";
   const res = await fetch(`${apiUrl}/chat`, {
@@ -29,7 +57,6 @@ export const signUpUser = async (formData: {
     targetLocations: string[];
     yearsExperience: number;
     skills: string[];
-    jobLevel: string;
   };
 }) => {
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5001";

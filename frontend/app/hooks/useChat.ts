@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { sendChatMessage } from "../utils/api";
 import io from "socket.io-client";
 
@@ -15,15 +15,45 @@ export interface SequenceStep {
   content: string;
 }
 
+export interface SavedSequence {
+  title: string;
+  steps: SequenceStep[];
+}
+
 export type LoadingStatus = {
   state: "thinking" | "generating" | "processing" | null;
   step?: string;
 };
 
+function getLoadingMessage(message: string): string {
+  const lower = message.toLowerCase();
+  if (lower.includes("find") && (lower.includes("job") || lower.includes("position") || lower.includes("role"))) {
+    return "Searching for jobs";
+  }
+  if (lower.includes("find") && (lower.includes("hiring") || lower.includes("recruiter") || lower.includes("manager") || lower.includes("people"))) {
+    return "Searching for people";
+  }
+  if (lower.includes("research") || lower.includes("tell me about") || lower.includes("what do you know about")) {
+    return "Researching company";
+  }
+  if (lower.includes("interview") || lower.includes("prep")) {
+    return "Preparing interview materials";
+  }
+  if (lower.includes("outreach") || lower.includes("sequence") || lower.includes("write")) {
+    return "Crafting your message";
+  }
+  if (lower.includes("skill")) {
+    return "Analyzing skills";
+  }
+  return "Thinking";
+}
+
 export const useChat = (sessionId: string | null) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [sequence, setSequence] = useState<SequenceStep[]>([]);
+  const [sequences, setSequences] = useState<SavedSequence[]>([]);
+  const [activeSequenceIndex, setActiveSequenceIndex] = useState(0);
   const [status, setStatus] = useState<LoadingStatus>({ state: null });
+  const isSendingRef = useRef(false);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(
     sessionId
   );
@@ -71,6 +101,15 @@ export const useChat = (sessionId: string | null) => {
   useEffect(() => {
     if (!currentSessionId) return;
 
+    // Skip reset/fetch if we're in the middle of sending (new session was just created)
+    if (isSendingRef.current) return;
+
+    // Clear stale data from previous session immediately
+    setMessages([]);
+    setSequences([]);
+    setActiveSequenceIndex(0);
+    setStatus({ state: null });
+
     const fetchData = async () => {
       try {
         // Fetch messages
@@ -90,8 +129,14 @@ export const useChat = (sessionId: string | null) => {
           }/sequence/${currentSessionId}`
         );
         if (sequenceRes.ok) {
-          const sequenceData = await sequenceRes.json();
-          setSequence(sequenceData);
+          const groupedData = await sequenceRes.json();
+          if (groupedData.length > 0) {
+            setSequences(groupedData.map((g: { title: string; steps: SequenceStep[] }) => ({
+              title: g.title,
+              steps: g.steps
+            })));
+            setActiveSequenceIndex(groupedData.length - 1);
+          }
         }
       } catch (error) {
         console.error("Error fetching data:", error);
@@ -107,11 +152,14 @@ export const useChat = (sessionId: string | null) => {
 
     const handleSequenceUpdate = (data: {
       session_id: string;
-      sequence: SequenceStep[];
+      sequences: Array<{ title: string; steps: SequenceStep[] }>;
     }) => {
       if (data.session_id === currentSessionId) {
-        console.log("🔁 Real-time update received", data);
-        setSequence(data.sequence);
+        // Skip during sends — sendMessage handles new sequences via API response
+        if (isSendingRef.current) return;
+        if (data.sequences && data.sequences.length > 0) {
+          setSequences(data.sequences.map((g) => ({ title: g.title, steps: g.steps })));
+        }
       }
     };
 
@@ -123,56 +171,44 @@ export const useChat = (sessionId: string | null) => {
 
   const sendMessage = async (content: string) => {
     try {
+      // Set sending flag before createSession so the session-change effect
+      // doesn't wipe our optimistic message when a new session is created
+      isSendingRef.current = true;
+
       // Create a new session if none exists
       const sessionIdToUse = currentSessionId || (await createSession());
       if (!sessionIdToUse) throw new Error("Failed to create or get session");
 
       setMessages((prev) => [...prev, { sender: "user", content }]);
-      setStatus({ state: "thinking", step: "Analyzing your request" });
+      setStatus({ state: "thinking", step: getLoadingMessage(content) });
 
       const data = await sendChatMessage(content, sessionIdToUse);
+      isSendingRef.current = false;
 
-      if (!data.sequence) {
-        setMessages((prev) => [
-          ...prev,
-          { sender: "ai", content: data.response },
-        ]);
-        setStatus({ state: null });
-        return;
+      if (data.sequences && data.sequences.length > 0) {
+        // Backend returns all grouped sequences — use them directly
+        const newSequences: SavedSequence[] = data.sequences.map((g: { title: string; steps: SequenceStep[] }) => ({
+          title: g.title,
+          steps: g.steps
+        }));
+        setSequences(newSequences);
+        setActiveSequenceIndex(newSequences.length - 1);
       }
 
-      const showGenerationSteps = async () => {
-        setStatus({ state: "generating", step: "Identifying key milestones" });
-        await new Promise((res) => setTimeout(res, 1000));
-
-        setStatus({ state: "generating", step: "Planning sequence steps" });
-        await new Promise((res) => setTimeout(res, 1000));
-
-        setStatus({
-          state: "generating",
-          step: "Creating detailed instructions",
-        });
-        await new Promise((res) => setTimeout(res, 1000));
-
-        // Update both sequence and messages in a single state update
-        setSequence(data.sequence);
-        setMessages((prev) => {
-          // Check if the AI message is already in the state
-          const lastMessage = prev[prev.length - 1];
-          if (
-            lastMessage?.sender === "ai" &&
-            lastMessage?.content === data.response
-          ) {
-            return prev;
-          }
-          return [...prev, { sender: "ai", content: data.response }];
-        });
-        setStatus({ state: null });
-      };
-
-      await showGenerationSteps();
+      setMessages((prev) => {
+        const lastMessage = prev[prev.length - 1];
+        if (
+          lastMessage?.sender === "ai" &&
+          lastMessage?.content === data.response
+        ) {
+          return prev;
+        }
+        return [...prev, { sender: "ai", content: data.response }];
+      });
+      setStatus({ state: null });
     } catch (error) {
       console.error("Error sending message:", error);
+      isSendingRef.current = false;
       setStatus({ state: null });
       setMessages((prev) => [
         ...prev,
@@ -186,7 +222,9 @@ export const useChat = (sessionId: string | null) => {
 
   return {
     messages,
-    sequence,
+    sequences,
+    activeSequenceIndex,
+    setActiveSequenceIndex,
     status,
     sendMessage,
   };

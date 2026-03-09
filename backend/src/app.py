@@ -4,6 +4,7 @@ from socketio_instance import socketio
 from database.db import db
 from database.models import User, Session, Message, SequenceStep
 from services.openai_client import chat_with_openai
+from agents.tools.core import get_grouped_sequences
 from flask import request, jsonify
 from dotenv import load_dotenv
 import os
@@ -166,10 +167,28 @@ def create_app(testing=False):
                                 - `add_step` (requires step content and session_id) - Use to add follow-ups or additional messages
                                 - `generate_networking_asset` - Use for one-off requests like "write a cold email," "thank you note," or "follow-up email"
                                 - `search_and_analyze_professionals` - Use to find potential employers or networking contacts based on role and location
+                                - `search_jobs` - Use to find job listings matching the user's criteria (title, location, job type)
+                                - `research_company` - Use to research a company in depth (overview, funding, culture, tech stack, news)
+                                - `prepare_for_interview` - Use to prepare for an interview at a specific company (process, questions, tips, compensation)
 
-                            2. **Clarify Intent**: If the user's request is unclear, ask a clarifying question before proceeding.
+                            2. **Outreach Personalization (CRITICAL)**:
+                               When the user asks to write an outreach sequence or message, DO NOT call generate_sequence immediately.
+                               Instead, follow this flow:
+                               a) First, acknowledge the request and ask 2-3 short, smart follow-up questions to personalize the outreach.
+                               b) Your questions should be SPECIFIC and contextual, not generic. Examples of GOOD questions:
+                                  - "What's the main thing you'd want them to know about your work — for example, a specific project or result you're proud of?"
+                                  - "Have you had any interaction with them or the company before (applied, met at an event, used their product)?"
+                                  - "Is there a specific role or team you're targeting, or is this more exploratory?"
+                                  - "What's your angle — are you reaching out as a user of their product, a fellow builder, or something else?"
+                               c) If you already have context from earlier in the conversation (e.g., you researched the company or found their profile), reference that in your questions.
+                                  For example: "I saw Perplexity just launched their Comet browser — do you want to reference that, or is there something else about their work that excites you?"
+                               d) Keep it to 2-3 questions max. Don't interrogate.
+                               e) Once the user answers, THEN call generate_sequence with their answers in the `personalization_notes` parameter.
+                               f) If the user says "just generate it" or seems impatient, go ahead and call the tool immediately.
 
-                            3. **Conversational Responses**: Respond conversationally if the user's input is vague or unrelated to sequence manipulation.
+                            3. **Clarify Intent**: If the user's request is unclear, ask a clarifying question before proceeding.
+
+                            4. **Conversational Responses**: Respond conversationally if the user's input is vague or unrelated to sequence manipulation.
 
                             **Common Job Seeker Needs**:
                             - Finding relevant hiring managers or team leads to contact
@@ -184,6 +203,13 @@ def create_app(testing=False):
                             - Senior roles → formal & strategic
                             - Startup companies → energetic & conversational
                             - Enterprise companies → formal & structured
+
+                            **Proactive Workflow Guidance**:
+                            - After finding jobs → suggest researching the company or finding people there
+                            - After researching a company → suggest finding people there or preparing for an interview
+                            - After interview prep → suggest writing outreach messages or practicing answers
+                            - After finding people → suggest generating a personalized outreach sequence
+                            - Always guide the user to the next logical step in their job search journey
 
                             **Your Role**: Act as a friendly, smart job search co-pilot, not a chatbot.
 
@@ -214,68 +240,19 @@ def create_app(testing=False):
             ai_result = chat_with_openai(messages, session_id=session_id)
 
             ai_response_text = ai_result["response"]
-            ai_sequence = ai_result.get("sequence")
 
             # Store AI message in DB
             ai_msg = Message(session_id=session_id, sender="ai", content=ai_response_text)
             db.session.add(ai_msg)
             db.session.commit()
 
-            # If a sequence was generated, save it
-            if ai_sequence:
-                print(f"Received sequence from OpenAI for session_id: {session_id}")  # Debug log
-                
-                try:
-                    # Delete existing steps
-                    SequenceStep.query.filter_by(session_id=session_id).delete()
-                    db.session.commit()
-
-                    # Validate and save new steps
-                    for step in ai_sequence:
-                        if not isinstance(step, dict) or "step_number" not in step or "content" not in step:
-                            print(f"Invalid step structure: {step}")
-                            continue
-                        
-                        new_step = SequenceStep(
-                            session_id=session_id,
-                            step_number=step["step_number"],
-                            content=step["content"].strip()
-                        )
-                        db.session.add(new_step)
-                    
-                    db.session.commit()
-
-                    # Verify saved steps
-                    saved_sequence = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
-                    print(f"Retrieved saved sequence for session_id {session_id}: {len(saved_sequence)} steps")
-                    
-                    if len(saved_sequence) == 0:
-                        print("Warning: No steps were saved to the database")
-                        sequence_data = []
-                    else:
-                        sequence_data = [
-                            {
-                                "step_number": step.step_number,
-                                "content": step.content
-                            }
-                            for step in saved_sequence
-                        ]
-                        # Emit updated sequence over WebSocket
-                        socketio.emit("sequence_updated", {
-                            "session_id": session_id,
-                            "sequence": sequence_data
-                        })
-                except Exception as e:
-                    print(f"Error saving sequence: {str(e)}")
-                    db.session.rollback()
-                    sequence_data = []
-            else:
-                sequence_data = []
+            # Fetch all grouped sequences (tool functions already saved steps)
+            sequences_data = get_grouped_sequences(session_id)
 
             # Return structured response
             response_data = {
                 "response": ai_response_text,
-                "sequence": sequence_data
+                "sequences": sequences_data
             }
             print(f"Sending response for session_id {session_id}: {response_data}")  # Debug log
             return jsonify(response_data)
@@ -288,15 +265,7 @@ def create_app(testing=False):
 
     @app.route("/sequence/<session_id>", methods=["GET"])
     def get_sequence(session_id):
-        steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
-
-        return jsonify([
-            {
-                "step_number": step.step_number,
-                "content": step.content
-            }
-            for step in steps
-        ])
+        return jsonify(get_grouped_sequences(session_id))
     
     @app.route("/signup", methods=["POST"])
     def signup():
@@ -319,7 +288,7 @@ def create_app(testing=False):
                 "targetLocations": data.get("target_locations", []),  # Preferred locations
                 "yearsExperience": data.get("years_experience", 0),  # Years of experience
                 "skills": data.get("skills", []),  # Key skills for job search
-                "jobLevel": data.get("job_level", "")  # e.g., "Entry", "Mid", "Senior"
+                "jobLevel": ""  # deprecated, kept for backwards compat
             })
         )
         db.session.add(user)
@@ -412,6 +381,22 @@ def create_app(testing=False):
         db.session.commit()
         
         return jsonify({"message": "Session deleted successfully"})
+
+    @app.route("/user/<user_id>", methods=["GET"])
+    def get_user(user_id):
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        return jsonify({
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "company": user.company,
+            "title": user.title,
+            "industry": user.industry,
+            "preferences": user.preferences or {}
+        })
 
     @app.route("/sessions/<session_id>", methods=["GET"])
     def get_session(session_id):

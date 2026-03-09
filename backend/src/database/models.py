@@ -79,20 +79,13 @@ class Message(db.Model):
 
 class SequenceStep(db.Model):
     """Model representing a single step in a candidate outreach sequence.
-    
-    This model stores the content and order of each step in a recruitment outreach sequence.
-    Each step is associated with a specific chat session and has a unique identifier.
-    
-    Attributes:
-        id (str): Primary key, UUID string
-        session_id (str): Foreign key linking to the Session model
-        step_number (int): The order of this step in the sequence
-        content (str): The actual content/text of the outreach step
-    
-    Relationships:
-        - Belongs to a Session (many-to-one relationship)
+
+    Steps are grouped by sequence_group (a UUID). Multiple sequences can exist
+    per session, each with its own group and title.
     """
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id = db.Column(db.String(36), db.ForeignKey("session.id"))
+    sequence_group = db.Column(db.String(36), default=lambda: str(uuid.uuid4()))
+    sequence_title = db.Column(db.String(100), default="Outreach Sequence")
     step_number = db.Column(db.Integer)
     content = db.Column(db.Text)

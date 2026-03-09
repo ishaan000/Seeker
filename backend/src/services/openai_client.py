@@ -9,9 +9,13 @@ from agents.tools import (
     add_step,
     generate_networking_asset,
     search_and_analyze_professionals,
-    generate_personalized_outreach
+    generate_personalized_outreach,
+    search_and_analyze_jobs,
+    research_company_tool,
+    prepare_for_interview_tool
 )
-from database.models import SequenceStep, Session, User
+from agents.tools.core import get_grouped_sequences
+from database.models import SequenceStep, Session
 import json
 
 
@@ -73,77 +77,99 @@ def chat_with_openai(messages: list, session_id: str) -> dict:
                     result = search_and_analyze_professionals(**args)
                 elif name == "generate_personalized_outreach":
                     result = generate_personalized_outreach(**args)
-                
+                elif name == "search_jobs":
+                    result = search_and_analyze_jobs(**args)
+                elif name == "research_company":
+                    result = research_company_tool(**args)
+                elif name == "prepare_for_interview":
+                    result = prepare_for_interview_tool(**args)
+
                 print(f"Tool execution result: {result}")  # Debug log
             except Exception as e:
                 print(f"Error executing tool {name}: {str(e)}")  # Debug log
                 continue
 
-        # After tool execution, fetch updated sequence
-        print(f"Fetching sequence for session_id: {session_id}")  # Debug log
-        steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
-        print(f"Found {len(steps)} steps for session_id: {session_id}")  # Debug log
+        follow_up_system = """You are Seeker, an AI job search assistant. You just completed an action for the user.
 
-        if name == "generate_sequence":
-            follow_up_prompt = """You just created an outreach sequence using the `generate_sequence` tool.
+Your response MUST have exactly two parts:
+1. A SHORT follow-up (1-2 sentences max) — reference specific details from the results
+2. Exactly 3 numbered suggestions in the format below — NEVER skip these
 
-        Now respond naturally:
-        - Mention that the sequence is ready.
-        - Offer to tweak the tone, revise a step, or regenerate it.
-        - Don't repeat your intro or say hello.
-        - Keep it short, friendly, and helpful.
-        """
-        elif name == "generate_networking_asset":
-            follow_up_prompt = """You just helped the job seeker using the `generate_networking_asset` tool.
+RULES:
+- Sound like a smart friend helping with their job search, not a robot.
+- Do NOT repeat or summarize results that are already displayed.
+- Reference SPECIFIC names, companies, roles from the conversation and results.
+- GOOD follow-ups:
+  - "Your 3-step sequence to Piotr leads with their Comet browser launch — should stand out."
+  - "Found 4 people at ElevenLabs you could reach out to."
+- BAD follow-ups (NEVER say these):
+  - "Great work on generating the outreach sequence."
+  - "Are you ready for the next steps?"
+  - "Here's how we might proceed."
 
-        Now respond naturally:
-        - Mention that the message is ready.
-        - Ask if the user wants to update the tone, fix any sections, or regenerate it.
-        - Be proactive and conversational — avoid starting with 'Hi' or repeating your name.
-        """
-        elif name == "search_and_analyze_professionals":
-            follow_up_prompt = """You just performed a professional search using the `search_and_analyze_professionals` tool.
+You MUST end your response with exactly this format (no exceptions):
 
-        Now respond naturally:
-        - Acknowledge that you've found relevant professionals.
-        - Ask if they'd like to:
-          - Generate a personalized outreach sequence for any of these professionals
-          - Get more details about specific professionals
-          - Refine the search with different criteria
-        - Keep it short and friendly.
-        - Don't repeat the search results (they're already displayed).
-        """
-        else:
-            follow_up_prompt = f"""You just used the `{name}` tool.
+Would you like to:
+1. [specific actionable suggestion with real names/companies]
+2. [specific actionable suggestion with real names/companies]
+3. [specific actionable suggestion with real names/companies]
 
-        Respond naturally:
-        - Mention what was done (e.g. revised a step, changed tone).
-        - Ask if there's anything else the user would like to tweak or explore.
-        - Keep it short and friendly.
-        """
+Pick from these actions (use real names from results):
+- Research [Company] - funding, culture, and recent news
+- Prep me for an interview at [Company] for a [Role] role
+- Find hiring managers at [Company]
+- Find [Role] jobs in [Location]
+- Write an outreach sequence to [Person Name] at [Company]
+- Revise step [N] to be more [specific change]
+- Change the tone to [casual/bold/formal]
+"""
 
-        # Step 3: Send follow-up prompt to get natural response
+        # Build recent conversation context for the follow-up LLM
+        # Include last few user/assistant messages so it has conversational awareness
+        recent_context = ""
+        user_messages_in_history = [m for m in messages if m.get("role") == "user"]
+        if user_messages_in_history:
+            last_user_msg = user_messages_in_history[-1]["content"]
+            recent_context = f"User's request: {last_user_msg}\n\n"
+
+        # For sequence generation, include a snippet of what was generated
+        result_context = result[:2000]
+        if name in ("generate_sequence", "generate_networking_asset"):
+            # Fetch the most recently created group's steps so the follow-up can reference actual content
+            latest_step = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.id.desc()).first()
+            if latest_step and latest_step.sequence_group:
+                new_steps = SequenceStep.query.filter_by(
+                    session_id=session_id, sequence_group=latest_step.sequence_group
+                ).order_by(SequenceStep.step_number).all()
+                if new_steps:
+                    step_previews = []
+                    for s in new_steps:
+                        preview = s.content[:150] + "..." if len(s.content) > 150 else s.content
+                        step_previews.append(f"Step {s.step_number}: {preview}")
+                    result_context = result + "\n\nSequence preview:\n" + "\n".join(step_previews)
+
+        # Step 3: Send follow-up with conversation context + results
         follow_up_response = client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": follow_up_prompt},
-                {"role": "user", "content": "What happened?"}
+                {"role": "system", "content": follow_up_system},
+                {"role": "user", "content": f"{recent_context}Tool used: {name}\n\nResults:\n{result_context}"}
             ]
         )
 
-        sequence_data = [{"step_number": step.step_number, "content": step.content} for step in steps]
-        print(f"Returning sequence data: {sequence_data}")  # Debug log
+        # Build grouped sequences
+        sequences_data = get_grouped_sequences(session_id)
 
         # If this was a search, include the search results in the response
-        if name == "search_and_analyze_professionals":
+        if name in ("search_and_analyze_professionals", "search_jobs", "research_company", "prepare_for_interview"):
             return {
                 "response": result + "\n\n" + follow_up_response.choices[0].message.content,
-                "sequence": sequence_data
+                "sequences": sequences_data
             }
 
         return {
             "response": follow_up_response.choices[0].message.content,
-            "sequence": sequence_data
+            "sequences": sequences_data
         }
 
     return {"response": message.content}

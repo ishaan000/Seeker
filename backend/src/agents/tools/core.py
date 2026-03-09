@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import json
 import re
 from typing import Dict, Any, Optional, List
-from .web_search import search_professionals, get_professional_details
+from .web_search import search_professionals, get_professional_details, search_jobs, research_company, research_interview_prep, research_for_outreach
 
 from socketio_instance import socketio  # import safely
 import logging
@@ -34,10 +34,21 @@ def get_sequence_data(session_id: str):
     steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
     return [{"step_number": step.step_number, "content": step.content} for step in steps]
 
-def emit_sequence_update(session_id: str):
+def get_grouped_sequences(session_id: str) -> list:
+    """Return all sequences for a session, grouped by sequence_group."""
     steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
-    sequence_data = [{"step_number": s.step_number, "content": s.content} for s in steps]
-    socketio.emit("sequence_updated", {"session_id": session_id, "sequence": sequence_data})
+    groups = {}
+    for s in steps:
+        group = s.sequence_group or "default"
+        if group not in groups:
+            groups[group] = {"title": s.sequence_title or "Outreach Sequence", "steps": []}
+        groups[group]["steps"].append({"step_number": s.step_number, "content": s.content})
+    return list(groups.values())
+
+
+def emit_sequence_update(session_id: str):
+    sequences = get_grouped_sequences(session_id)
+    socketio.emit("sequence_updated", {"session_id": session_id, "sequences": sequences})
 
 def validate_sequence_params(role: str, location: str) -> Optional[str]:
     """Validates the input parameters for sequence generation."""
@@ -47,8 +58,8 @@ def validate_sequence_params(role: str, location: str) -> Optional[str]:
         return "Role and location exceed maximum length limits"
     return None
 
-def generate_sequence(role: str, location: str, session_id: str, step_count: Optional[int] = None, profile_url: Optional[str] = None) -> str:
-    print(f"\nGenerating sequence for role: {role}, location: {location}, session_id: {session_id}, profile_url: {profile_url}")
+def generate_sequence(role: str, location: str, session_id: str, step_count: Optional[int] = None, profile_url: Optional[str] = None, company: Optional[str] = None, recipient_name: Optional[str] = None, personalization_notes: Optional[str] = None) -> str:
+    print(f"\nGenerating sequence for role: {role}, location: {location}, session_id: {session_id}, company: {company}, recipient: {recipient_name}")
 
     validation_error = validate_sequence_params(role, location)
     if validation_error:
@@ -58,55 +69,88 @@ def generate_sequence(role: str, location: str, session_id: str, step_count: Opt
     session = Session.query.get(session_id)
     user_name = session.user.name if session and session.user else "the job seeker"
     user_title = session.user.title if session and session.user else "professional"
+    user = session.user if session else None
 
-    # Get professional details if profile_url is provided
+    # Build rich user context
+    user_context = get_user_context(session_id)
+
+    # --- Agentic Research Phase ---
+    # 1. Research the company for outreach-relevant intel
+    company_research = ""
+    if company:
+        print(f"Researching {company} for outreach context...")
+        company_research = research_for_outreach(
+            company=company,
+            role=role,
+            recipient_name=recipient_name
+        )
+        if company_research:
+            print(f"Got {len(company_research)} chars of company research")
+
+    # 2. Research the recipient if we have a profile URL
     professional_context = ""
     if profile_url:
         try:
             details = get_professional_details(profile_url)
             professional_context = f"""
-            Professional Details:
-            - Profile: {profile_url}
-            - Current Position: {details.get('title', 'N/A')}
-            - Background: {details.get('content', 'N/A')}
-            
-            Use these details to personalize the networking/job application sequence. Reference specific aspects of their company and role that align with the job seeker's skills and interests.
-            """
+RECIPIENT RESEARCH:
+- Profile: {profile_url}
+- Current Position: {details.get('title', 'N/A')}
+- Background: {details.get('content', 'N/A')}
+"""
         except Exception as e:
             logger.error(f"Error fetching professional details: {str(e)}")
-            professional_context = ""
 
-    base_prompt = f"""
-Generate a professional outreach sequence for a job seeker interested in a {role} position based in {location}.
-The messages should be written from {user_name}'s perspective as a {user_title}.
-Make sure to highlight relevant skills and experience that would make them a good fit for the role.
+    # 3. Build skills context
+    skills_context = ""
+    if user and user.preferences:
+        prefs = user.preferences
+        skills = prefs.get("skills", [])
+        if skills:
+            skills_context = f"Key skills: {', '.join(skills)}"
+        years = prefs.get("yearsExperience", 0)
+        if years:
+            skills_context += f"\nYears of experience: {years}"
 
-Follow this structure for each step:
-1. Initial Outreach: Introduce yourself, mention how you found them, and express specific interest in their company/team. Highlight 1-2 relevant skills or experiences that make you a good fit. End with a clear call to action (like requesting a brief conversation).
+    # Build personalization section
+    personalization_section = ""
+    if personalization_notes:
+        personalization_section = f"""--- USER'S PERSONAL CONTEXT (this is the MOST important input — make the sequence feel like it came from THIS person) ---
+{personalization_notes}
+"""
 
-2. Follow-up: If no response, send a brief, friendly follow-up that adds value - perhaps sharing an insight about their industry or a recent company announcement. Reiterate your interest and make it easy to respond.
+    base_prompt = f"""Write a 3-step outreach sequence from {user_name} ({user_title}) to {'the hiring manager' if not recipient_name else recipient_name} at {company or 'the target company'} for a {role} position in {location}.
 
-3. Final Touch: If still no response, send one final message that's concise and direct, emphasizing your continued interest and offering flexibility for a brief conversation.
+{user_context}
+
+{skills_context}
+
+{personalization_section}
+
+--- COMPANY RESEARCH (use specific details from this) ---
+{company_research if company_research else 'No specific company research available. Write a strong general outreach.'}
 
 {professional_context}
 
-Respond in JSON format as a list like:
+CRITICAL INSTRUCTIONS:
+- The user's personal context above is your #1 priority. Weave their specific stories, projects, angles, and motivations into every message.
+- Each message MUST reference at least one SPECIFIC detail from the company research above (a recent launch, funding round, blog post, product, initiative, etc.)
+- Connect the user's personal context to the company's work — show WHY this person is reaching out to THIS company
+- The first message should open with something that shows genuine knowledge — NOT "I came across your profile" or "I'm reaching out because"
+- Weave in {user_name}'s specific skills ({skills_context}) and how they connect to what {company or 'the company'} is doing
+- Each follow-up should add NEW value (a new insight, a different angle) — never just "checking in"
+- Keep messages under 150 words each — busy people don't read long cold emails
+- Sound human, not templated. No corporate buzzwords.
+
+Respond ONLY with a JSON array:
 [
   {{ "step_number": 1, "content": "..." }},
   {{ "step_number": 2, "content": "..." }},
   {{ "step_number": 3, "content": "..." }}
-]
+]"""
 
-Each message should be complete and self-contained. Make sure to:
-- Keep messages concise but personal
-- Reference specific details about the company/role
-- Highlight relevant skills and experiences
-- Include clear next steps
-- Maintain a professional yet conversational tone
-- Avoid generic language
-"""
     if step_count:
-        base_prompt = f"Generate a {step_count}-step outreach sequence for a job seeker interested in a {role} position in {location}.\n" + base_prompt
+        base_prompt = base_prompt.replace("3-step", f"{step_count}-step")
 
     try:
         response = client.chat.completions.create(
@@ -114,12 +158,12 @@ Each message should be complete and self-contained. Make sure to:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a job search assistant that creates personalized outreach sequences for networking and job applications. Generate professional and engaging outreach messages that follow a clear structure and reference specific details about the target company and role when available. Each message should be complete and self-contained."
+                    "content": "You are an elite cold outreach strategist. You write messages that get responses because they demonstrate genuine research, specific relevance, and concise value. Never write generic outreach. Every sentence must earn its place."
                 },
                 {"role": "user", "content": base_prompt}
             ],
             temperature=0.7,
-            max_tokens=2000  # Ensure we get complete responses
+            max_tokens=2000
         )
 
         content = response.choices[0].message.content
@@ -154,34 +198,39 @@ Each message should be complete and self-contained. Make sure to:
                 return f"Invalid content type: {type(step['content'])}. Expected str. Raw content:\n{content}"
 
         try:
-            # Delete existing steps
-            SequenceStep.query.filter_by(session_id=session_id).delete()
-            db.session.commit()
+            import uuid as _uuid
+            group_id = str(_uuid.uuid4())
 
-            # Add new steps
+            # Build a smart title
+            seq_title = f"Outreach to {company}" if company else f"Outreach - {role}"
+            if recipient_name:
+                seq_title = f"Outreach to {recipient_name}"
+
+            # Add new steps in a new group (keep old sequences intact)
             for step in steps_json:
                 new_step = SequenceStep(
                     session_id=session_id,
+                    sequence_group=group_id,
+                    sequence_title=seq_title,
                     step_number=step["step_number"],
-                    content=step["content"].strip()  # Ensure content is stripped
+                    content=step["content"].strip()
                 )
                 db.session.add(new_step)
-                print(f"Adding step {step['step_number']} for session {session_id}")
+                print(f"Adding step {step['step_number']} for session {session_id}, group {group_id}")
 
             db.session.commit()
             print(f"Successfully saved {len(steps_json)} steps for session {session_id}")
 
-            # Verify the steps were saved
-            saved_steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
-            print(f"Verified {len(saved_steps)} steps in database for session {session_id}")
-
-            if len(saved_steps) != len(steps_json):
-                print(f"Warning: Saved steps count ({len(saved_steps)}) doesn't match generated steps count ({len(steps_json)})")
-                db.session.rollback()
-                return "Error: Failed to save all steps correctly"
-
             emit_sequence_update(session_id)
-            return "Outreach sequence generated and saved successfully."
+
+            # Return a rich summary so the follow-up LLM can reference specifics
+            target = recipient_name or f"the hiring manager at {company}" if company else "the target"
+            summary = f"Generated a {len(steps_json)}-step outreach sequence to {target} for a {role} role."
+            if company:
+                summary += f" Company: {company}."
+            if personalization_notes:
+                summary += f" Personalized based on: {personalization_notes[:200]}"
+            return summary
 
         except Exception as e:
             db.session.rollback()
@@ -205,24 +254,20 @@ def get_user_context(session_id: str) -> str:
     target_locations = ", ".join(prefs.get("targetLocations", []) or [])
     years_experience = prefs.get("yearsExperience", 0)
     skills = ", ".join(prefs.get("skills", []) or [])
-    job_level = prefs.get("jobLevel", "")
-    
+
     context = f"""
 The messages should be written from {user.name}'s perspective as a {user.title} in the {user.industry} industry.
 """
 
     if user.company:
         context += f"Their current or previous company is {user.company}.\n"
-    
+
     if years_experience:
         context += f"They have {years_experience} years of experience.\n"
-    
+
     if skills:
         context += f"Their key skills include: {skills}.\n"
-    
-    if job_level:
-        context += f"They are looking for {job_level}-level positions.\n"
-    
+
     if job_types:
         context += f"They are interested in {job_types} roles.\n"
     
@@ -235,7 +280,12 @@ The messages should be written from {user.name}'s perspective as a {user.title} 
     return context
 
 def revise_step(session_id: str, step_number: int, new_instruction: str) -> str:
-    step = SequenceStep.query.filter_by(session_id=session_id, step_number=step_number).first()
+    # Target the most recent sequence group to avoid modifying the wrong sequence
+    latest = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.id.desc()).first()
+    group_filter = {"session_id": session_id, "step_number": step_number}
+    if latest and latest.sequence_group:
+        group_filter["sequence_group"] = latest.sequence_group
+    step = SequenceStep.query.filter_by(**group_filter).first()
     if not step:
         return f"Step {step_number} not found."
 
@@ -258,7 +308,12 @@ Rewritten message:"""
     return f"Step {step_number} revised."
 
 def change_tone(session_id: str, tone: str) -> str:
-    steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
+    # Target the most recent sequence group only
+    latest = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.id.desc()).first()
+    if latest and latest.sequence_group:
+        steps = SequenceStep.query.filter_by(session_id=session_id, sequence_group=latest.sequence_group).order_by(SequenceStep.step_number).all()
+    else:
+        steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
     if not steps:
         return "No steps found for this session."
 
@@ -280,7 +335,12 @@ Rewritten message:"""
     return f"All steps updated to have a more {tone} tone."
 
 def add_step(session_id: str, step_content: str, position: Optional[int] = None) -> str:
-    steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
+    # Target the most recent sequence group only
+    latest = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.id.desc()).first()
+    if latest and latest.sequence_group:
+        steps = SequenceStep.query.filter_by(session_id=session_id, sequence_group=latest.sequence_group).order_by(SequenceStep.step_number).all()
+    else:
+        steps = SequenceStep.query.filter_by(session_id=session_id).order_by(SequenceStep.step_number).all()
 
     if position is None or position > len(steps):
         position = len(steps) + 1
@@ -305,8 +365,14 @@ New message:"""
         if step.step_number >= position:
             step.step_number += 1
 
-    # Add the new step
-    new_step = SequenceStep(session_id=session_id, step_number=position, content=new_content)
+    # Add the new step (inherit sequence_group from existing steps)
+    new_step = SequenceStep(
+        session_id=session_id,
+        step_number=position,
+        content=new_content,
+        sequence_group=latest.sequence_group if latest and latest.sequence_group else None,
+        sequence_title=latest.sequence_title if latest else "Outreach Sequence"
+    )
     db.session.add(new_step)
 
     # Reorder everything to ensure consistent step numbering
@@ -320,29 +386,62 @@ New message:"""
 
 def generate_networking_asset(task: str, session_id: str):
     user_context = get_user_context(session_id)
-    prompt = f"""
-You're a job search assistant. Based on the following instruction, generate a fully formatted message (email, letter, follow-up, etc).
+
+    # Try to extract company name from the task for research
+    company_research = ""
+    # Simple extraction: look for "at [Company]" or "to [Company]" patterns
+    import re as _re
+    company_match = _re.search(r'(?:at|to|for|from)\s+([A-Z][A-Za-z0-9\s&.]+?)(?:\s+(?:for|about|regarding|as|in)|[,.]|$)', task)
+    if company_match:
+        extracted_company = company_match.group(1).strip()
+        if len(extracted_company) > 2:
+            print(f"Researching {extracted_company} for networking asset...")
+            company_research = research_for_outreach(company=extracted_company)
+
+    prompt = f"""You are an elite outreach writer. Write a message based on the task below.
+
 {user_context}
+
 Task: {task}
 
-Format the result as if it will be sent to a potential employer, hiring manager, or networking contact.
+--- COMPANY RESEARCH (reference specific details from this) ---
+{company_research if company_research else 'No specific research available.'}
+
+RULES:
+- Reference at least one SPECIFIC detail from the research above
+- Sound human, not templated
+- Keep it under 200 words
+- Every sentence must earn its place
 """
 
     response = client.chat.completions.create(
         model="gpt-4",
-        messages=[{ "role": "user", "content": prompt }],
+        messages=[
+            {"role": "system", "content": "You write cold outreach messages that get responses because they show genuine research and specific relevance."},
+            {"role": "user", "content": prompt}
+        ],
         temperature=0.7
     )
 
     content = response.choices[0].message.content.strip()
 
-    # Store it as a single step
-    SequenceStep.query.filter_by(session_id=session_id).delete()
-    db.session.add(SequenceStep(session_id=session_id, step_number=1, content=content))
+    import uuid as _uuid
+    group_id = str(_uuid.uuid4())
+
+    # Derive title from the company match or task
+    seq_title = f"Message - {extracted_company}" if company_match and extracted_company else task[:30]
+
+    db.session.add(SequenceStep(
+        session_id=session_id,
+        sequence_group=group_id,
+        sequence_title=seq_title,
+        step_number=1,
+        content=content
+    ))
     db.session.commit()
     emit_sequence_update(session_id)
 
-    return "Networking asset generated successfully."
+    return f"Generated: {seq_title}. Preview: {content[:150]}..."
 
 def search_and_analyze_professionals(
     session_id: str,
@@ -376,7 +475,8 @@ def search_and_analyze_professionals(
             location=location,
             years_experience=years_experience,
             skills=skills,
-            current_company=current_company
+            current_company=current_company,
+            user_context=user_context
         )
         
         if not results["professionals"]:
@@ -405,12 +505,7 @@ def search_and_analyze_professionals(
             
             # Add profile link
             response += f"Profile: {prof['link']}\n\n"
-        
-        response += "\nWould you like to:\n"
-        response += "1. Generate a personalized outreach sequence for any of these professionals (I'll use their profile details to create a tailored message)\n"
-        response += "2. Get more details about specific professionals\n"
-        response += "3. Refine the search with different criteria"
-        
+
         return response
         
     except Exception as e:
@@ -467,20 +562,172 @@ def generate_personalized_outreach(profile_url: str, session_id: str) -> str:
     except Exception as e:
         return f"An error occurred while generating the outreach message: {str(e)}"
 
+def search_and_analyze_jobs(
+    session_id: str,
+    query: str,
+    location: Optional[str] = None,
+    job_type: Optional[str] = None
+) -> str:
+    """
+    Search for job listings and format results for the user.
+
+    Args:
+        session_id (str): The session ID
+        query (str): Job search query (e.g., "Senior Software Engineer")
+        location (Optional[str]): Location to search in
+        job_type (Optional[str]): Type of job (fulltime, parttime, contract, internship)
+
+    Returns:
+        str: Formatted job listings
+    """
+    try:
+        user_context = get_user_context(session_id)
+        results = search_jobs(
+            query=query,
+            location=location,
+            job_type=job_type,
+            user_context=user_context
+        )
+
+        if not results["jobs"]:
+            return f"I couldn't find any job listings matching '{query}'" + (f" in {location}" if location else "") + ". Would you like to try different search criteria?"
+
+        response = f"I found {results['total_found']} job listings matching '{query}'"
+        if location:
+            response += f" in {location}"
+        response += ":\n\n"
+
+        for i, job in enumerate(results["jobs"], 1):
+            response += f"{i}. **{job['title']}**\n"
+            response += f"   Company: {job['company']}\n"
+            response += f"   Location: {job['location']}\n"
+            if job.get("schedule"):
+                response += f"   Type: {job['schedule']}\n"
+            if job.get("posted"):
+                response += f"   Posted: {job['posted']}\n"
+            if job.get("description"):
+                response += f"   {job['description']}\n"
+            if job.get("link"):
+                response += f"   Link: {job['link']}\n"
+            response += "\n"
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in search_and_analyze_jobs: {str(e)}", exc_info=True)
+        return f"An error occurred while searching for jobs: {str(e)}"
+
+
+def _format_value(value) -> str:
+    """Convert a value (str, list, dict) into a readable string."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(f"- {item}" if isinstance(item, str) else f"- {json.dumps(item)}" for item in value)
+    if isinstance(value, dict):
+        return "\n".join(f"- {k}: {v}" for k, v in value.items())
+    return str(value)
+
+
+def research_company_tool(
+    session_id: str,
+    company: str,
+    role: Optional[str] = None
+) -> str:
+    """
+    Research a company and return formatted insights.
+    """
+    try:
+        user_context = get_user_context(session_id)
+        results = research_company(company=company, role=role, user_context=user_context)
+
+        if not results["found"]:
+            return f"I couldn't find detailed information about {company}. Would you like to try a different company?"
+
+        insights = results["insights"]
+
+        # If we got raw_content (parsing failed), try regex extraction as last resort
+        if "raw_content" in insights:
+            from .web_search import _extract_fields_regex
+            extracted = _extract_fields_regex(insights["raw_content"])
+            if extracted:
+                insights = extracted
+            else:
+                return f"Here's what I found about {company}:\n\n{insights['raw_content']}"
+
+        response = f"Here's what I found about {company}:\n\n"
+        response += f"**Company Overview**\n{_format_value(insights.get('company_overview', 'No information available.'))}\n\n"
+        response += f"**Funding & Financials**\n{_format_value(insights.get('funding_financials', 'No information available.'))}\n\n"
+        response += f"**Recent News**\n{_format_value(insights.get('recent_news', 'No information available.'))}\n\n"
+        response += f"**Company Culture**\n{_format_value(insights.get('company_culture', 'No information available.'))}\n\n"
+        response += f"**Tech Stack**\n{_format_value(insights.get('tech_stack', 'No information available.'))}\n\n"
+        response += f"**Employee Count**\n{_format_value(insights.get('employee_count', 'No information available.'))}\n\n"
+        response += f"**Why Work Here**\n{_format_value(insights.get('why_work_here', 'No information available.'))}"
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in research_company_tool: {str(e)}", exc_info=True)
+        return f"An error occurred while researching {company}: {str(e)}"
+
+
+def prepare_for_interview_tool(
+    session_id: str,
+    company: str,
+    role: Optional[str] = None
+) -> str:
+    """
+    Prepare for an interview and return formatted prep material.
+    """
+    try:
+        user_context = get_user_context(session_id)
+        results = research_interview_prep(company=company, role=role, user_context=user_context)
+
+        if not results["found"]:
+            return f"I couldn't find interview preparation details for {company}. Would you like to try a different company?"
+
+        prep = results["prep"]
+
+        # If we got raw_content (parsing failed), try regex extraction as last resort
+        if "raw_content" in prep:
+            from .web_search import _extract_fields_regex
+            extracted = _extract_fields_regex(prep["raw_content"])
+            if extracted:
+                prep = extracted
+            else:
+                return f"Here's your interview prep for {company}:\n\n{prep['raw_content']}"
+
+        response = f"Here's your interview prep for {company}:\n\n"
+        response += f"**Interview Process**\n{_format_value(prep.get('interview_process', 'No information available.'))}\n\n"
+        response += f"**Common Questions**\n{_format_value(prep.get('common_questions', 'No information available.'))}\n\n"
+        response += f"**What They Look For**\n{_format_value(prep.get('what_they_look_for', 'No information available.'))}\n\n"
+        response += f"**Tips for Success**\n{_format_value(prep.get('tips_for_success', 'No information available.'))}\n\n"
+        response += f"**Compensation Range**\n{_format_value(prep.get('compensation_range', 'No information available.'))}"
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in prepare_for_interview_tool: {str(e)}", exc_info=True)
+        return f"An error occurred while preparing interview materials for {company}: {str(e)}"
+
+
 tool_definitions = [
     {
         "type": "function",
         "function": {
             "name": "generate_sequence",
-            "description": "Generates a job application or networking outreach sequence based on role and location, optionally personalized for a specific professional",
+            "description": "Generates a deeply researched, personalized outreach sequence. Automatically researches the target company for recent news, launches, and intel to make messages stand out. Use this for multi-step outreach campaigns.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "role": {"type": "string", "description": "The role you're interested in"},
-                    "location": {"type": "string", "description": "Where the job is based"},
-                    "step_count": {"type": "integer", "description": "Optional. Number of outreach steps to include"},
+                    "role": {"type": "string", "description": "The role the user is interested in (e.g., 'Software Engineer', 'Product Manager')"},
+                    "location": {"type": "string", "description": "Where the job is based (e.g., 'San Francisco', 'Remote')"},
+                    "company": {"type": "string", "description": "The target company name (e.g., 'Google', 'Stripe'). Will be auto-researched for personalization."},
+                    "recipient_name": {"type": "string", "description": "Optional. Name of the person to address the outreach to"},
+                    "step_count": {"type": "integer", "description": "Optional. Number of outreach steps (default 3)"},
                     "session_id": {"type": "string", "description": "The session ID as a string UUID"},
-                    "profile_url": {"type": "string", "description": "Optional. URL of the professional's profile to personalize the sequence"}
+                    "profile_url": {"type": "string", "description": "Optional. LinkedIn URL of the recipient for deeper personalization"},
+                    "personalization_notes": {"type": "string", "description": "The user's answers to follow-up questions — their personal angle, specific projects, motivations, prior interactions with the company, etc. This is critical for making the outreach feel personal and specific."}
                 },
                 "required": ["role", "location", "session_id"]
             }
@@ -570,6 +817,23 @@ tool_definitions = [
     {
         "type": "function",
         "function": {
+            "name": "search_jobs",
+            "description": "Searches for job listings matching the user's criteria",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "The session ID as a string UUID"},
+                    "query": {"type": "string", "description": "The job search query (e.g., 'Senior Software Engineer', 'Product Manager')"},
+                    "location": {"type": "string", "description": "Optional. Location to search in (e.g., 'San Francisco, CA')"},
+                    "job_type": {"type": "string", "description": "Optional. Type of job: fulltime, parttime, contract, internship"}
+                },
+                "required": ["session_id", "query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "generate_personalized_outreach",
             "description": "Generates a personalized outreach message for a specific professional based on their profile",
             "parameters": {
@@ -579,6 +843,38 @@ tool_definitions = [
                     "profile_url": {"type": "string", "description": "The URL of the professional's profile"}
                 },
                 "required": ["session_id", "profile_url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "research_company",
+            "description": "Researches a company in depth - overview, funding, culture, tech stack, recent news, and reasons to work there",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "The session ID as a string UUID"},
+                    "company": {"type": "string", "description": "The company name to research (e.g., 'Google', 'Stripe')"},
+                    "role": {"type": "string", "description": "Optional. The role the user is interested in at this company"}
+                },
+                "required": ["session_id", "company"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "prepare_for_interview",
+            "description": "Prepares interview materials for a specific company - interview process, common questions, tips, and compensation ranges",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "The session ID as a string UUID"},
+                    "company": {"type": "string", "description": "The company name to prepare for (e.g., 'Google', 'Meta')"},
+                    "role": {"type": "string", "description": "Optional. The specific role to prepare for"}
+                },
+                "required": ["session_id", "company"]
             }
         }
     }

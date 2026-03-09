@@ -191,12 +191,16 @@ export default function ChatSidebar({
     <Box
       sx={{
         width: isExpanded ? "300px" : "60px",
+        flexShrink: 0,
         height: "100%",
-        borderRight: "1px solid rgba(255, 255, 255, 0.1)",
+        borderRight: "1px solid rgba(255, 255, 255, 0.06)",
+        background: "rgba(10, 10, 15, 0.4)",
+        backdropFilter: "blur(20px)",
         display: "flex",
         flexDirection: "column",
         transition: "width 0.3s ease-in-out",
         position: "relative",
+        overflow: "hidden",
       }}
     >
       <Box
@@ -205,7 +209,7 @@ export default function ChatSidebar({
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          borderBottom: "1px solid rgba(255, 255, 255, 0.1)",
+          borderBottom: "1px solid rgba(255, 255, 255, 0.06)",
         }}
       >
         {isExpanded && <Typography variant="h6">Chat History</Typography>}
@@ -227,7 +231,7 @@ export default function ChatSidebar({
 
       <Collapse in={isExpanded}>
         <List
-          sx={{ flex: 1, overflow: "auto", maxHeight: "calc(100vh - 64px)" }}
+          sx={{ flex: 1, overflowY: "auto", overflowX: "hidden" }}
         >
           {sessions.map((session) => (
             <ListItem
@@ -272,12 +276,16 @@ export default function ChatSidebar({
                     display: "flex",
                     justifyContent: "space-between",
                     alignItems: "center",
+                    transition: "all 0.2s ease",
+                    borderLeft: currentSessionId === session.session_id
+                      ? "2px solid rgba(151, 71, 255, 0.6)"
+                      : "2px solid transparent",
                     "&:hover": {
-                      backgroundColor: "rgba(255, 255, 255, 0.1)",
+                      backgroundColor: "rgba(255, 255, 255, 0.05)",
                     },
                     backgroundColor:
                       currentSessionId === session.session_id
-                        ? "rgba(151, 71, 255, 0.1)"
+                        ? "rgba(151, 71, 255, 0.08)"
                         : "transparent",
                   }}
                 >
